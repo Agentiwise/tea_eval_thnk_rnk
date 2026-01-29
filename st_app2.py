@@ -529,17 +529,17 @@ def show_auth_page():
         <div class="auth-card">
             <div class="lock-icon">🔐</div>
             <div class="auth-title">Authentication Required</div>
-            <div class="auth-subtitle">Please enter your API key to access the dashboard</div>
+            <div class="auth-subtitle">Please enter your Password to access the dashboard</div>
         </div>
         """, unsafe_allow_html=True)
         
         # API Key input
         api_key_input = st.text_input(
-            "API Key",
+            "Password",
             type="password",
-            placeholder="Enter your API key",
-            help="Enter the API key provided to you",
-            key="api_key_input"
+            placeholder="Enter your Password",
+            help="Enter the Password provided to you",
+            key="Password_input"
         )
         
         # Verify button
@@ -550,13 +550,13 @@ def show_auth_page():
                     st.session_state.api_key = api_key_input
                     st.rerun()
                 else:
-                    st.error("❌ Invalid API key. Please check and try again.")
+                    st.error("❌ Invalid Password. Please check and try again.")
             else:
-                st.warning("⚠️ Please enter an API key.")
+                st.warning("⚠️ Please enter a Password.")
         
         st.markdown("""
         <p style="text-align: center; color: #9ca3af; font-size: 0.85rem; margin-top: 1.5rem;">
-            Don't have an API key? Contact your administrator.
+            Don't have a Password? Contact your administrator.
         </p>
         """, unsafe_allow_html=True)
 
