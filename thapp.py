@@ -408,7 +408,6 @@ complete class transcript
             {"role": "system", "content": EVALUATION_SYSTEM_PROMPT},
             {"role": "user", "content": user_content}
         ],
-        temperature=0.4,
         response_format={
             "type": "json_schema",
             "json_schema": {
