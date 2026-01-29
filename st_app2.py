@@ -579,15 +579,6 @@ def show_main_app():
     with st.sidebar:
         st.markdown("### ⚙️ Evaluation Settings")
         
-        # Show authenticated status
-        st.success("✅ Authenticated")
-        
-        if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.authenticated = False
-            st.session_state.api_key = None
-            st.rerun()
-        
-        st.markdown("---")
         
         # Input fields
         st.markdown("##### 🎵 Audio File URL")
@@ -633,10 +624,20 @@ def show_main_app():
             label_visibility="collapsed"
         )
         
-        st.markdown("---")
+
         
         # Run evaluation button
         run_evaluation = st.button("🚀 Run Evaluation", use_container_width=True)
+        st.markdown("---")
+
+        st.success("✅ Authenticated")
+        
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.api_key = None
+            st.rerun()
+        
+        st.markdown("---")
     
     # Main content area
     if run_evaluation:
