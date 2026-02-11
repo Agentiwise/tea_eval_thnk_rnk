@@ -10,6 +10,15 @@ import time
 import io
 from fpdf import FPDF
 from thapp import run_teacher_evaluation
+import smtplib
+import re
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Page configuration
 st.set_page_config(
@@ -276,13 +285,15 @@ def get_valid_api_key():
     """Get the valid API key from secrets."""
     try:
         return st.secrets["api"]["api_key"]
-    except:
-        return "a7k9m3x5q1"  # Fallback default
+    except Exception:
+        return None
 
 
 def validate_api_key(entered_key: str) -> bool:
     """Validate the entered API key."""
     valid_key = get_valid_api_key()
+    if valid_key is None:
+        return False
     return entered_key == valid_key
 
 
@@ -516,6 +527,235 @@ def get_status_color(status: str) -> str:
     return status_colors.get(status.upper(), '#6b7280')
 
 
+def sanitize_sheet_tab_name(name: str) -> str:
+    """
+    Sanitize a string to be a valid Google Sheets tab name.
+
+    Google Sheets tab names cannot contain: / \\ * ? : [ ]
+    Max length is 100 characters.
+
+    Args:
+        name: The raw class name string
+
+    Returns:
+        A sanitized string safe for use as a Google Sheets tab name.
+    """
+    if not name or not name.strip():
+        return "Evaluation"
+
+    sanitized = name.strip()
+    # Replace forbidden characters with underscore
+    for char in ['/', '\\', '*', '?', ':', '[', ']']:
+        sanitized = sanitized.replace(char, '_')
+
+    # Truncate to 100 characters
+    sanitized = sanitized[:100]
+
+    # Final fallback if everything was stripped
+    if not sanitized.strip():
+        return "Evaluation"
+
+    return sanitized
+
+
+def upload_to_google_sheets(df: pd.DataFrame, class_name: str) -> tuple:
+    """
+    Upload a DataFrame to a new tab in the fixed Google Spreadsheet.
+
+    Creates a new worksheet tab with the class name and writes the
+    evaluation data. Handles duplicate tab names by appending a timestamp.
+
+    Args:
+        df: The evaluation DataFrame (potentially edited by user).
+        class_name: The class name to use as the tab name.
+
+    Returns:
+        Tuple of (success: bool, message: str).
+    """
+    SPREADSHEET_ID = st.secrets["SPREADSHEET_ID"]
+
+    try:
+        # Build credentials from secrets (no JSON file needed)
+        service_account_info = dict(st.secrets["gcp_service_account"])
+
+        # Sanitize tab name
+        tab_name = sanitize_sheet_tab_name(class_name)
+
+        # Authenticate
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        gc = gspread.authorize(creds)
+
+        # Open spreadsheet
+        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+
+        # Handle duplicate tab names by appending timestamp
+        existing_titles = [ws.title for ws in spreadsheet.worksheets()]
+        if tab_name in existing_titles:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tab_name = f"{tab_name}_{timestamp}"[:100]
+
+        # Clean DataFrame: replace NaN with empty string, convert all to str
+        df_clean = df.fillna("").astype(str)
+
+        # Create new worksheet
+        rows = len(df_clean) + 1  # +1 for header
+        cols = len(df_clean.columns)
+        worksheet = spreadsheet.add_worksheet(title=tab_name, rows=rows, cols=cols)
+
+        # Prepare data as list of lists (header + data rows)
+        header = df_clean.columns.tolist()
+        data = df_clean.values.tolist()
+        all_data = [header] + data
+
+        # Write data to sheet
+        worksheet.update(all_data, value_input_option='USER_ENTERED')
+
+        return (True, f"✅ Successfully uploaded to sheet tab '{tab_name}'")
+
+    except gspread.exceptions.APIError as e:
+        return (False, f"Google Sheets API error: {str(e)}")
+    except Exception as e:
+        return (False, f"Failed to upload to Google Sheets: {str(e)}")
+
+
+def validate_email_addresses(email_string: str) -> tuple:
+    """
+    Validate one or more comma-separated email addresses.
+
+    Args:
+        email_string: Raw string from user input, may contain
+                      comma-separated emails.
+
+    Returns:
+        Tuple of (is_valid: bool, parsed_emails: list[str], error_message: str).
+    """
+    if not email_string or not email_string.strip():
+        return (False, [], "No email address provided.")
+
+    # Split by comma and strip whitespace
+    parts = [e.strip() for e in email_string.split(",") if e.strip()]
+
+    if not parts:
+        return (False, [], "No valid email addresses found.")
+
+    # Simple email regex validation
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    invalid = [e for e in parts if not email_pattern.match(e)]
+
+    if invalid:
+        return (False, [], f"Invalid email address(es): {', '.join(invalid)}")
+
+    return (True, parts, "")
+
+
+def send_evaluation_email(
+    to_emails: list,
+    class_name: str,
+    df: pd.DataFrame,
+    csv_data: str,
+    pdf_data: bytes
+) -> tuple:
+    """
+    Send evaluation results via email with CSV and PDF attachments.
+
+    Args:
+        to_emails: List of validated recipient email addresses.
+        class_name: The class name for subject and body.
+        df: The DataFrame used to generate summary statistics.
+        csv_data: CSV string content for attachment.
+        pdf_data: PDF bytes content for attachment.
+
+    Returns:
+        Tuple of (success: bool, message: str).
+    """
+    FROM_EMAIL = st.secrets["GMAIL_SENDER"]
+
+    try:
+        APP_PASSWORD = st.secrets["GMAIL_SMTP"]
+    except Exception:
+        return (False, "GMAIL_SMTP password not found in secrets. Please configure it.")
+
+    try:
+        # Build subject
+        subject = f"Teacher Evaluation Report - {class_name}" if class_name else "Teacher Evaluation Report"
+
+        # Build summary statistics for email body
+        total = len(df)
+        completed = len(df[df.get('Status', pd.Series()).str.upper() == 'COMPLETED']) if 'Status' in df.columns else 0
+        partial = len(df[df.get('Status', pd.Series()).str.upper() == 'PARTIAL']) if 'Status' in df.columns else 0
+        missing = len(df[df.get('Status', pd.Series()).str.upper() == 'MISSING']) if 'Status' in df.columns else 0
+
+        # Calculate average rating excluding zeros
+        if 'Overall Rating' in df.columns:
+            ratings = pd.to_numeric(df['Overall Rating'], errors='coerce')
+            valid_ratings = ratings[ratings > 0]
+            avg_rating = valid_ratings.mean() if len(valid_ratings) > 0 else 0
+        else:
+            avg_rating = 0
+
+        body = f"""Teacher Evaluation Report
+========================
+Class: {class_name or "N/A"}
+
+Summary:
+- Total Activities: {total}
+- Completed: {completed}
+- Partial: {partial}
+- Missing: {missing}
+- Average Rating: {avg_rating:.1f}/10
+
+Please find the detailed evaluation results attached as CSV and PDF files.
+
+---
+This email was sent automatically by the Teacher Evaluation Dashboard.
+"""
+
+        # Create email message
+        msg = MIMEMultipart()
+        msg['From'] = FROM_EMAIL
+        msg['To'] = ", ".join(to_emails)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Attach CSV
+        csv_attachment = MIMEBase('text', 'csv')
+        csv_attachment.set_payload(csv_data.encode('utf-8'))
+        encoders.encode_base64(csv_attachment)
+        csv_filename = f"teacher_evaluation_{class_name}.csv" if class_name else "teacher_evaluation.csv"
+        csv_attachment.add_header('Content-Disposition', f'attachment; filename="{csv_filename}"')
+        msg.attach(csv_attachment)
+
+        # Attach PDF
+        pdf_attachment = MIMEBase('application', 'pdf')
+        pdf_attachment.set_payload(pdf_data)
+        encoders.encode_base64(pdf_attachment)
+        pdf_filename = f"teacher_evaluation_{class_name}.pdf" if class_name else "teacher_evaluation.pdf"
+        pdf_attachment.add_header('Content-Disposition', f'attachment; filename="{pdf_filename}"')
+        msg.attach(pdf_attachment)
+
+        # Send email
+        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=30)
+        server.starttls()
+        server.login(FROM_EMAIL, APP_PASSWORD)
+        server.sendmail(FROM_EMAIL, to_emails, msg.as_string())
+        server.quit()
+
+        return (True, f"✅ Email sent successfully to {', '.join(to_emails)}")
+
+    except smtplib.SMTPAuthenticationError:
+        return (False, "SMTP authentication failed. Check Gmail app password in secrets.")
+    except smtplib.SMTPException as e:
+        return (False, f"SMTP error: {str(e)}")
+    except TimeoutError:
+        return (False, "SMTP connection timed out. Please try again.")
+    except Exception as e:
+        return (False, f"Failed to send email: {str(e)}")
+
+
 def show_auth_page():
     """Display the authentication page."""
     st.markdown('<h1 class="main-header">📚 Teacher Evaluation Dashboard</h1>', unsafe_allow_html=True)
@@ -574,7 +814,15 @@ def show_main_app():
         st.session_state.df = None
     if 'class_name_saved' not in st.session_state:
         st.session_state.class_name_saved = ""
-    
+    if 'sheets_upload_status' not in st.session_state:
+        st.session_state.sheets_upload_status = None
+    if 'sheets_upload_message' not in st.session_state:
+        st.session_state.sheets_upload_message = ""
+    if 'email_send_status' not in st.session_state:
+        st.session_state.email_send_status = None
+    if 'email_send_message' not in st.session_state:
+        st.session_state.email_send_message = ""
+
     # Sidebar for inputs
     with st.sidebar:
         st.markdown("### ⚙️ Evaluation Settings")
@@ -623,9 +871,16 @@ def show_main_app():
             height=100,
             label_visibility="collapsed"
         )
-        
 
-        
+        st.markdown("##### ✉️ Email Recipient (Optional)")
+        email_recipient = st.text_input(
+            "Email Address",
+            placeholder="email@example.com or comma-separated",
+            help="Enter email address(es) to send results. Separate multiple with commas.",
+            label_visibility="collapsed",
+            key="email_recipient_input"
+        )
+
         # Run evaluation button
         run_evaluation = st.button("🚀 Run Evaluation", use_container_width=True)
         st.markdown("---")
@@ -647,7 +902,11 @@ def show_main_app():
         else:
             # Save class name for PDF
             st.session_state.class_name_saved = class_name
-            
+            st.session_state.sheets_upload_status = None
+            st.session_state.sheets_upload_message = ""
+            st.session_state.email_send_status = None
+            st.session_state.email_send_message = ""
+
             # Show loading animation
             with st.container():
                 loading_placeholder = st.empty()
@@ -693,6 +952,9 @@ def show_main_app():
                         
                         progress_bar.progress(100)
                         status_text.text("✅ Evaluation complete!")
+
+                        st.toast("Evaluation complete! Your results are ready.", icon="✅")
+
                         time.sleep(0.5)
                         
                     except Exception as e:
@@ -832,10 +1094,11 @@ def show_main_app():
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
         
         # Export options
-        st.markdown("### 💾 Export Options")
-        
+        st.markdown("### 💾 Export & Share")
+
+        # Row 1: File downloads
         col1, col2 = st.columns(2)
-        
+
         with col1:
             # Export as CSV
             csv = edited_df.to_csv(index=False)
@@ -846,15 +1109,15 @@ def show_main_app():
                 mime="text/csv",
                 use_container_width=True
             )
-        
+
         with col2:
             # Export as PDF
             try:
                 pdf_bytes = generate_pdf_report(
-                    edited_df, 
+                    edited_df,
                     class_name=st.session_state.class_name_saved
                 )
-                file_name_pdf="teacher_evaluation_report"+st.session_state.class_name_saved+".pdf"
+                file_name_pdf = "teacher_evaluation_report" + st.session_state.class_name_saved + ".pdf"
                 st.download_button(
                     label="📥 Download PDF",
                     data=pdf_bytes,
@@ -864,7 +1127,76 @@ def show_main_app():
                 )
             except Exception as e:
                 st.error(f"Error generating PDF: {str(e)}")
-        
+
+        # Row 2: Share options
+        col3, col4 = st.columns(2)
+
+        with col3:
+            # Google Sheets upload
+            if st.button("📊 Upload to Google Sheets", use_container_width=True, key="sheets_upload_btn"):
+                with st.spinner("Uploading to Google Sheets..."):
+                    success, message = upload_to_google_sheets(
+                        edited_df,
+                        st.session_state.class_name_saved
+                    )
+                    st.session_state.sheets_upload_status = "success" if success else "error"
+                    st.session_state.sheets_upload_message = message
+
+            # Display upload status
+            if st.session_state.sheets_upload_status == "success":
+                st.success(st.session_state.sheets_upload_message)
+            elif st.session_state.sheets_upload_status == "error":
+                st.error(st.session_state.sheets_upload_message)
+
+        with col4:
+            # Send Email
+            email_input_value = st.session_state.get("email_recipient_input", "")
+            email_button_disabled = not email_input_value.strip()
+
+            if st.button(
+                "✉️ Send Email",
+                use_container_width=True,
+                key="send_email_btn",
+                disabled=email_button_disabled
+            ):
+                # Validate email addresses
+                is_valid, parsed_emails, error_msg = validate_email_addresses(email_input_value)
+
+                if not is_valid:
+                    st.session_state.email_send_status = "error"
+                    st.session_state.email_send_message = error_msg
+                else:
+                    with st.spinner("Sending email..."):
+                        try:
+                            # Generate CSV and PDF for attachment
+                            csv_for_email = edited_df.to_csv(index=False)
+                            pdf_for_email = generate_pdf_report(
+                                edited_df,
+                                class_name=st.session_state.class_name_saved
+                            )
+
+                            success, message = send_evaluation_email(
+                                to_emails=parsed_emails,
+                                class_name=st.session_state.class_name_saved,
+                                df=edited_df,
+                                csv_data=csv_for_email,
+                                pdf_data=pdf_for_email
+                            )
+                            st.session_state.email_send_status = "success" if success else "error"
+                            st.session_state.email_send_message = message
+                        except Exception as e:
+                            st.session_state.email_send_status = "error"
+                            st.session_state.email_send_message = f"Error: {str(e)}"
+
+            if not email_input_value.strip():
+                st.caption("💡 Enter an email in the sidebar to enable sending.")
+
+            # Display email status
+            if st.session_state.email_send_status == "success":
+                st.success(st.session_state.email_send_message)
+            elif st.session_state.email_send_status == "error":
+                st.error(st.session_state.email_send_message)
+
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
         
         # Detailed view section
