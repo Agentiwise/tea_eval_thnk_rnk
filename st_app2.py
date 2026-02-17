@@ -12,6 +12,7 @@ from fpdf import FPDF
 from thapp import run_teacher_evaluation
 import smtplib
 import re
+import os
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -558,9 +559,9 @@ def sanitize_sheet_tab_name(name: str) -> str:
     return sanitized
 
 
-def upload_to_google_sheets(df: pd.DataFrame, class_name: str) -> tuple:
+def upload_to_google_sheets(df: pd.DataFrame, class_name: str, spreadsheet_id: str = None) -> tuple:
     """
-    Upload a DataFrame to a new tab in the fixed Google Spreadsheet.
+    Upload a DataFrame to a new tab in a Google Spreadsheet.
 
     Creates a new worksheet tab with the class name and writes the
     evaluation data. Handles duplicate tab names by appending a timestamp.
@@ -568,29 +569,22 @@ def upload_to_google_sheets(df: pd.DataFrame, class_name: str) -> tuple:
     Args:
         df: The evaluation DataFrame (potentially edited by user).
         class_name: The class name to use as the tab name.
+        spreadsheet_id: The Google Spreadsheet ID to upload to.
 
     Returns:
         Tuple of (success: bool, message: str).
     """
-    SPREADSHEET_ID = st.secrets["SPREADSHEET_ID"]
+    if not spreadsheet_id:
+        return (False, "No center selected. Please select a center in the sidebar.")
 
     try:
-        # Build credentials from secrets (no JSON file needed)
-        service_account_info = dict(st.secrets["gcp_service_account"])
+        gc = _get_gspread_client()
 
         # Sanitize tab name
         tab_name = sanitize_sheet_tab_name(class_name)
 
-        # Authenticate
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-        gc = gspread.authorize(creds)
-
         # Open spreadsheet
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+        spreadsheet = gc.open_by_key(spreadsheet_id)
 
         # Handle duplicate tab names by appending timestamp
         existing_titles = [ws.title for ws in spreadsheet.worksheets()]
@@ -616,10 +610,126 @@ def upload_to_google_sheets(df: pd.DataFrame, class_name: str) -> tuple:
 
         return (True, f"✅ Successfully uploaded to sheet tab '{tab_name}'")
 
+    except gspread.exceptions.SpreadsheetNotFound:
+        return (False, "Spreadsheet not found. The sheet ID may be invalid or the service account lacks access.")
     except gspread.exceptions.APIError as e:
         return (False, f"Google Sheets API error: {str(e)}")
     except Exception as e:
         return (False, f"Failed to upload to Google Sheets: {str(e)}")
+
+
+def _get_gspread_client():
+    """Create and return an authenticated gspread client using service account credentials."""
+    service_account_info = dict(st.secrets["gcp_service_account"])
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def _get_centers_file_path():
+    """Return the absolute path to centers.json, located alongside this script."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "centers.json")
+
+
+def load_centers():
+    """
+    Load center configurations from centers.json.
+
+    Returns:
+        list[dict]: List of center dicts with 'sheet_id' key. Empty list if file missing/malformed.
+    """
+    filepath = _get_centers_file_path()
+    try:
+        with open(filepath, "r") as f:
+            data = json.load(f)
+        return data.get("centers", [])
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def save_centers(centers):
+    """
+    Save center configurations to centers.json.
+
+    Args:
+        centers: List of center dicts, each with a 'sheet_id' key.
+    """
+    filepath = _get_centers_file_path()
+    with open(filepath, "w") as f:
+        json.dump({"centers": centers}, f, indent=2)
+
+
+@st.cache_data(ttl=300)
+def fetch_center_names(sheet_ids):
+    """
+    Fetch spreadsheet titles from Google for a tuple of sheet IDs.
+
+    Cached for 5 minutes to avoid hitting the Google API on every Streamlit rerun.
+
+    Args:
+        sheet_ids: Tuple of sheet ID strings (tuple for hashability with cache).
+
+    Returns:
+        dict: Mapping of sheet_id -> spreadsheet title string.
+    """
+    gc = _get_gspread_client()
+    names = {}
+    for sid in sheet_ids:
+        try:
+            spreadsheet = gc.open_by_key(sid)
+            names[sid] = spreadsheet.title
+        except gspread.exceptions.APIError:
+            names[sid] = f"Inaccessible ({sid[:8]}...)"
+        except Exception:
+            names[sid] = f"Unknown ({sid[:8]}...)"
+    return names
+
+
+def create_new_center(name):
+    """
+    Create a new Google Spreadsheet to serve as a center's evaluation store.
+
+    The spreadsheet is owned by the service account and shared with the admin
+    email (GMAIL_SENDER) as an editor.
+
+    Args:
+        name: Display name for the spreadsheet (becomes the title).
+
+    Returns:
+        Tuple of (success: bool, message: str, sheet_id: str).
+    """
+    if not name or not name.strip():
+        return (False, "Center name cannot be empty.", "")
+
+    try:
+        gc = _get_gspread_client()
+        spreadsheet = gc.create(name.strip())
+        new_sheet_id = spreadsheet.id
+
+        # Share with admin email so a human can access it
+        try:
+            admin_email = st.secrets["GMAIL_SENDER"]
+            spreadsheet.share(admin_email, perm_type='user', role='writer')
+        except Exception:
+            pass  # Non-fatal: the service account still owns it
+
+        # Persist to centers.json
+        centers = load_centers()
+        centers.append({"sheet_id": new_sheet_id})
+        save_centers(centers)
+
+        # Clear cached center names so the new one shows up
+        fetch_center_names.clear()
+
+        return (True, f"Created center '{name.strip()}' successfully.", new_sheet_id)
+
+    except gspread.exceptions.APIError as e:
+        return (False, f"Google API error: {str(e)}", "")
+    except Exception as e:
+        return (False, f"Failed to create center: {str(e)}", "")
 
 
 def validate_email_addresses(email_string: str) -> tuple:
@@ -822,6 +932,14 @@ def show_main_app():
         st.session_state.email_send_status = None
     if 'email_send_message' not in st.session_state:
         st.session_state.email_send_message = ""
+    if 'selected_center_id' not in st.session_state:
+        st.session_state.selected_center_id = None
+    if 'show_add_center_form' not in st.session_state:
+        st.session_state.show_add_center_form = False
+    if 'add_center_status' not in st.session_state:
+        st.session_state.add_center_status = None
+    if 'add_center_message' not in st.session_state:
+        st.session_state.add_center_message = ""
 
     # Sidebar for inputs
     with st.sidebar:
@@ -854,7 +972,73 @@ def show_main_app():
             help="Enter the number of students in the class",
             label_visibility="collapsed"
         )
-        
+
+        # --- Center Selection ---
+        st.markdown("##### 🏢 Center")
+        centers = load_centers()
+
+        if centers:
+            sheet_ids = tuple(c["sheet_id"] for c in centers)
+            center_names = fetch_center_names(sheet_ids)
+
+            display_options = []
+            id_by_display = {}
+            for c in centers:
+                sid = c["sheet_id"]
+                title = center_names.get(sid, f"Unknown ({sid[:8]}...)")
+                display_options.append(title)
+                id_by_display[title] = sid
+
+            selected_display = st.selectbox(
+                "Center",
+                options=display_options,
+                help="Select the center whose spreadsheet will receive the evaluation results.",
+                label_visibility="collapsed",
+                key="center_selectbox"
+            )
+
+            if selected_display:
+                st.session_state.selected_center_id = id_by_display[selected_display]
+                # Show clickable link to the selected sheet
+                sheet_url = f"https://docs.google.com/spreadsheets/d/{id_by_display[selected_display]}"
+                st.markdown(f'<a href="{sheet_url}" target="_blank" style="font-size: 0.85rem; color: #3d5a80;">📎 Open Sheet</a>', unsafe_allow_html=True)
+        else:
+            st.info("No centers configured. Add one below.")
+            st.session_state.selected_center_id = None
+
+        if st.button("➕ Add New Center", use_container_width=True, key="toggle_add_center"):
+            st.session_state.show_add_center_form = not st.session_state.show_add_center_form
+            st.session_state.add_center_status = None
+            st.session_state.add_center_message = ""
+
+        if st.session_state.show_add_center_form:
+            new_center_name = st.text_input(
+                "New Center Name",
+                placeholder="e.g., Downtown Learning Center",
+                key="new_center_name_input",
+                label_visibility="collapsed"
+            )
+            if st.button("Create Center", use_container_width=True, key="create_center_btn"):
+                if new_center_name and new_center_name.strip():
+                    with st.spinner("Creating spreadsheet..."):
+                        success, message, new_id = create_new_center(new_center_name)
+                        st.session_state.add_center_status = "success" if success else "error"
+                        st.session_state.add_center_message = message
+                        if success:
+                            st.session_state.selected_center_id = new_id
+                            st.session_state.show_add_center_form = False
+                            st.rerun()
+                else:
+                    st.session_state.add_center_status = "error"
+                    st.session_state.add_center_message = "Please enter a name for the center."
+
+            if st.session_state.add_center_status == "success":
+                st.success(st.session_state.add_center_message)
+            elif st.session_state.add_center_status == "error":
+                st.error(st.session_state.add_center_message)
+
+        st.markdown("")
+
         st.markdown("##### 🏫 Class Name")
         class_name = st.text_input(
             "Class Name",
@@ -862,7 +1046,7 @@ def show_main_app():
             help="Enter the name of the class",
             label_visibility="collapsed"
         )
-        
+
         st.markdown("##### 📝 Custom Instructions")
         custom_instruction = st.text_area(
             "Custom Instructions",
@@ -1134,13 +1318,19 @@ def show_main_app():
         with col3:
             # Google Sheets upload
             if st.button("📊 Upload to Google Sheets", use_container_width=True, key="sheets_upload_btn"):
-                with st.spinner("Uploading to Google Sheets..."):
-                    success, message = upload_to_google_sheets(
-                        edited_df,
-                        st.session_state.class_name_saved
-                    )
-                    st.session_state.sheets_upload_status = "success" if success else "error"
-                    st.session_state.sheets_upload_message = message
+                selected_id = st.session_state.get("selected_center_id")
+                if not selected_id:
+                    st.session_state.sheets_upload_status = "error"
+                    st.session_state.sheets_upload_message = "No center selected. Please select a center in the sidebar."
+                else:
+                    with st.spinner("Uploading to Google Sheets..."):
+                        success, message = upload_to_google_sheets(
+                            edited_df,
+                            st.session_state.class_name_saved,
+                            spreadsheet_id=selected_id
+                        )
+                        st.session_state.sheets_upload_status = "success" if success else "error"
+                        st.session_state.sheets_upload_message = message
 
             # Display upload status
             if st.session_state.sheets_upload_status == "success":
